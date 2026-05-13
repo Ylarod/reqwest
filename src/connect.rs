@@ -33,6 +33,46 @@ use sealed::{Conn, Unnameable};
 
 pub(crate) type HttpConnector = hyper_util::client::legacy::connect::HttpConnector<DynResolver>;
 
+/// Helper returning an empty `Arc<[KeyingMaterialSpec]>`.
+///
+/// Used in `Conn { … }` literals that intentionally don't propagate
+/// the client-level EKM specs (e.g. proxy / SOCKS tunnels where
+/// `tls_info` is forced to `false`).
+///
+/// The empty `Arc` is allocated once per process and reused across all
+/// fallback connection paths; each call returns a cheap refcount-bumping
+/// `Arc::clone` rather than allocating a fresh zero-length backing buffer.
+/// Implemented with `std::sync::Once` + a leaked `Box` rather than
+/// `OnceLock` because the crate's MSRV is 1.64 (`OnceLock` stabilised in
+/// 1.70).
+fn empty_keying_material_specs() -> std::sync::Arc<[crate::tls_keying_material::KeyingMaterialSpec]>
+{
+    use std::sync::atomic::{AtomicPtr, Ordering};
+    use std::sync::{Arc, Once};
+
+    type EmptySpecsArc = Arc<[crate::tls_keying_material::KeyingMaterialSpec]>;
+
+    // The cell stores a pointer to a heap-allocated `EmptySpecsArc`. We
+    // leak the `Box` on the winning store so the `Arc` it holds lives for
+    // the rest of the process; readers only `.clone()` it.
+    static INIT: Once = Once::new();
+    static CACHE: AtomicPtr<EmptySpecsArc> = AtomicPtr::new(std::ptr::null_mut());
+
+    INIT.call_once(|| {
+        let arc: EmptySpecsArc = Arc::from(
+            Vec::<crate::tls_keying_material::KeyingMaterialSpec>::new(),
+        );
+        let raw = Box::into_raw(Box::new(arc));
+        CACHE.store(raw, Ordering::Release);
+    });
+
+    let ptr = CACHE.load(Ordering::Acquire);
+    // SAFETY: `INIT.call_once` guarantees the store above happens-before
+    // this load, so `ptr` is non-null and points to a `Box`-leaked
+    // `EmptySpecsArc` that is never freed.
+    unsafe { (*ptr).clone() }
+}
+
 #[derive(Clone)]
 pub(crate) enum Connector {
     // base service, with or without an embedded timeout
@@ -77,6 +117,8 @@ pub(crate) struct ConnectorBuilder {
     #[cfg(feature = "__tls")]
     tls_info: bool,
     #[cfg(feature = "__tls")]
+    keying_material_specs: Arc<[crate::tls_keying_material::KeyingMaterialSpec]>,
+    #[cfg(feature = "__tls")]
     user_agent: Option<HeaderValue>,
     #[cfg(feature = "socks")]
     resolver: Option<DynResolver>,
@@ -98,6 +140,8 @@ where {
             nodelay: self.nodelay,
             #[cfg(feature = "__tls")]
             tls_info: self.tls_info,
+            #[cfg(feature = "__tls")]
+            keying_material_specs: self.keying_material_specs,
             #[cfg(feature = "__tls")]
             user_agent: self.user_agent,
             simple_timeout: None,
@@ -223,6 +267,7 @@ where {
     }
 
     #[cfg(feature = "__native-tls")]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_native_tls<T>(
         http: HttpConnector,
         tls: TlsConnectorBuilder,
@@ -244,6 +289,7 @@ where {
         interface: Option<&str>,
         nodelay: bool,
         tls_info: bool,
+        keying_material_specs: Arc<[crate::tls_keying_material::KeyingMaterialSpec]>,
     ) -> crate::Result<ConnectorBuilder>
     where
         T: Into<Option<IpAddr>>,
@@ -270,10 +316,12 @@ where {
             interface,
             nodelay,
             tls_info,
+            keying_material_specs,
         ))
     }
 
     #[cfg(feature = "__native-tls")]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_built_native_tls<T>(
         mut http: HttpConnector,
         tls: TlsConnector,
@@ -295,6 +343,7 @@ where {
         interface: Option<&str>,
         nodelay: bool,
         tls_info: bool,
+        keying_material_specs: Arc<[crate::tls_keying_material::KeyingMaterialSpec]>,
     ) -> ConnectorBuilder
     where
         T: Into<Option<IpAddr>>,
@@ -324,6 +373,7 @@ where {
             verbose: verbose::OFF,
             nodelay,
             tls_info,
+            keying_material_specs,
             user_agent,
             timeout: None,
             #[cfg(feature = "socks")]
@@ -336,6 +386,7 @@ where {
     }
 
     #[cfg(feature = "__rustls")]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_rustls_tls<T>(
         mut http: HttpConnector,
         tls: rustls::ClientConfig,
@@ -357,6 +408,7 @@ where {
         interface: Option<&str>,
         nodelay: bool,
         tls_info: bool,
+        keying_material_specs: Arc<[crate::tls_keying_material::KeyingMaterialSpec]>,
     ) -> ConnectorBuilder
     where
         T: Into<Option<IpAddr>>,
@@ -399,6 +451,7 @@ where {
             verbose: verbose::OFF,
             nodelay,
             tls_info,
+            keying_material_specs,
             user_agent,
             timeout: None,
             #[cfg(feature = "socks")]
@@ -495,6 +548,8 @@ pub(crate) struct ConnectorService {
     #[cfg(feature = "__tls")]
     tls_info: bool,
     #[cfg(feature = "__tls")]
+    keying_material_specs: Arc<[crate::tls_keying_material::KeyingMaterialSpec]>,
+    #[cfg(feature = "__tls")]
     user_agent: Option<HeaderValue>,
     #[cfg(feature = "socks")]
     resolver: DynResolver,
@@ -544,6 +599,10 @@ impl ConnectorService {
             }
         };
 
+        // Snapshot the EKM specs before we borrow self.inner mutably below.
+        #[cfg(feature = "__tls")]
+        let ekm_specs = self.keying_material_specs.clone();
+
         match &mut self.inner {
             #[cfg(feature = "__native-tls")]
             Inner::NativeTls(http, tls) => {
@@ -559,6 +618,7 @@ impl ConnectorService {
                         inner: self.verbose.wrap(NativeTlsConn { inner: io }),
                         is_proxy: false,
                         tls_info: self.tls_info,
+                        keying_material_specs: ekm_specs,
                     });
                 }
             }
@@ -583,7 +643,12 @@ impl ConnectorService {
                     return Ok(Conn {
                         inner: self.verbose.wrap(RustlsTlsConn { inner: io }),
                         is_proxy: false,
+                        // Pre-existing rustls-SOCKS behavior: `tls_info` is
+                        // hardcoded false on this path (asymmetric with the
+                        // native-tls SOCKS branch). EKM is not affected because
+                        // no `TlsInfo` extension is attached for this conn.
                         tls_info: false,
+                        keying_material_specs: empty_keying_material_specs(),
                     });
                 }
             }
@@ -594,6 +659,7 @@ impl ConnectorService {
                     inner: self.verbose.wrap(TokioIo::new(conn)),
                     is_proxy: false,
                     tls_info: false,
+                    keying_material_specs: empty_keying_material_specs(),
                 });
             }
         }
@@ -606,11 +672,14 @@ impl ConnectorService {
                 inner: self.verbose.wrap(TokioIo::new(tcp)),
                 is_proxy: false,
                 tls_info: false,
+                keying_material_specs: empty_keying_material_specs(),
             })
             .map_err(Into::into)
     }
 
     async fn connect_with_maybe_proxy(self, dst: Uri, is_proxy: bool) -> Result<Conn, BoxError> {
+        #[cfg(feature = "__tls")]
+        let ekm_specs = self.keying_material_specs.clone();
         match self.inner {
             #[cfg(not(feature = "__tls"))]
             Inner::Http(mut http) => {
@@ -619,6 +688,7 @@ impl ConnectorService {
                     inner: self.verbose.wrap(io),
                     is_proxy,
                     tls_info: false,
+                    keying_material_specs: empty_keying_material_specs(),
                 })
             }
             #[cfg(feature = "__native-tls")]
@@ -651,12 +721,14 @@ impl ConnectorService {
                         inner: self.verbose.wrap(NativeTlsConn { inner: stream }),
                         is_proxy,
                         tls_info: self.tls_info,
+                        keying_material_specs: ekm_specs,
                     })
                 } else {
                     Ok(Conn {
                         inner: self.verbose.wrap(io),
                         is_proxy,
                         tls_info: false,
+                        keying_material_specs: empty_keying_material_specs(),
                     })
                 }
             }
@@ -683,12 +755,14 @@ impl ConnectorService {
                         inner: self.verbose.wrap(RustlsTlsConn { inner: stream }),
                         is_proxy,
                         tls_info: self.tls_info,
+                        keying_material_specs: ekm_specs,
                     })
                 } else {
                     Ok(Conn {
                         inner: self.verbose.wrap(io),
                         is_proxy,
                         tls_info: false,
+                        keying_material_specs: empty_keying_material_specs(),
                     })
                 }
             }
@@ -727,6 +801,8 @@ impl ConnectorService {
             })
         };
         let is_proxy = false;
+        #[cfg(feature = "__tls")]
+        let ekm_specs = self.keying_material_specs.clone();
         match self.inner {
             #[cfg(not(feature = "__tls"))]
             Inner::Http(..) => {
@@ -736,6 +812,7 @@ impl ConnectorService {
                     inner: self.verbose.wrap(io),
                     is_proxy,
                     tls_info: false,
+                    keying_material_specs: empty_keying_material_specs(),
                 })
             }
             #[cfg(feature = "__native-tls")]
@@ -749,12 +826,14 @@ impl ConnectorService {
                         inner: self.verbose.wrap(NativeTlsConn { inner: stream }),
                         is_proxy,
                         tls_info: self.tls_info,
+                        keying_material_specs: ekm_specs,
                     })
                 } else {
                     Ok(Conn {
                         inner: self.verbose.wrap(io),
                         is_proxy,
                         tls_info: false,
+                        keying_material_specs: empty_keying_material_specs(),
                     })
                 }
             }
@@ -768,12 +847,14 @@ impl ConnectorService {
                         inner: self.verbose.wrap(RustlsTlsConn { inner: stream }),
                         is_proxy,
                         tls_info: self.tls_info,
+                        keying_material_specs: ekm_specs,
                     })
                 } else {
                     Ok(Conn {
                         inner: self.verbose.wrap(io),
                         is_proxy,
                         tls_info: false,
+                        keying_material_specs: empty_keying_material_specs(),
                     })
                 }
             }
@@ -834,6 +915,7 @@ impl ConnectorService {
                         }),
                         is_proxy: false,
                         tls_info: false,
+                        keying_material_specs: empty_keying_material_specs(),
                     });
                 }
             }
@@ -881,6 +963,7 @@ impl ConnectorService {
                         }),
                         is_proxy: false,
                         tls_info: false,
+                        keying_material_specs: empty_keying_material_specs(),
                     });
                 }
             }
@@ -956,13 +1039,25 @@ impl Service<Uri> for ConnectorService {
 
 #[cfg(feature = "__tls")]
 trait TlsInfoFactory {
-    fn tls_info(&self) -> Option<crate::tls::TlsInfo>;
+    /// Build a [`TlsInfo`][crate::tls::TlsInfo] from the underlying TLS
+    /// stream, optionally exporting one [`KeyingMaterialEntry`] per spec.
+    ///
+    /// `specs` is forwarded down to the leaf TLS impl. Non-TLS leaves and
+    /// `native-tls` leaves ignore it (`native-tls` cannot export keying
+    /// material today — V1 limitation).
+    fn tls_info(
+        &self,
+        specs: &[crate::tls_keying_material::KeyingMaterialSpec],
+    ) -> Option<crate::tls::TlsInfo>;
 }
 
 #[cfg(feature = "__tls")]
 impl<T: TlsInfoFactory> TlsInfoFactory for TokioIo<T> {
-    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
-        self.inner().tls_info()
+    fn tls_info(
+        &self,
+        specs: &[crate::tls_keying_material::KeyingMaterialSpec],
+    ) -> Option<crate::tls::TlsInfo> {
+        self.inner().tls_info(specs)
     }
 }
 
@@ -970,21 +1065,30 @@ impl<T: TlsInfoFactory> TlsInfoFactory for TokioIo<T> {
 
 #[cfg(feature = "__tls")]
 impl TlsInfoFactory for tokio::net::TcpStream {
-    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+    fn tls_info(
+        &self,
+        _specs: &[crate::tls_keying_material::KeyingMaterialSpec],
+    ) -> Option<crate::tls::TlsInfo> {
         None
     }
 }
 
 #[cfg(feature = "__native-tls")]
 impl TlsInfoFactory for tokio_native_tls::TlsStream<TokioIo<TokioIo<tokio::net::TcpStream>>> {
-    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+    fn tls_info(
+        &self,
+        specs: &[crate::tls_keying_material::KeyingMaterialSpec],
+    ) -> Option<crate::tls::TlsInfo> {
         let peer_certificate = self
             .get_ref()
             .peer_certificate()
             .ok()
             .flatten()
             .and_then(|c| c.to_der().ok());
-        Some(crate::tls::TlsInfo { peer_certificate })
+        Some(crate::tls::TlsInfo {
+            peer_certificate,
+            keying_material: native_tls_keying_material(specs),
+        })
     }
 }
 
@@ -994,22 +1098,31 @@ impl TlsInfoFactory
         TokioIo<hyper_tls::MaybeHttpsStream<TokioIo<tokio::net::TcpStream>>>,
     >
 {
-    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+    fn tls_info(
+        &self,
+        specs: &[crate::tls_keying_material::KeyingMaterialSpec],
+    ) -> Option<crate::tls::TlsInfo> {
         let peer_certificate = self
             .get_ref()
             .peer_certificate()
             .ok()
             .flatten()
             .and_then(|c| c.to_der().ok());
-        Some(crate::tls::TlsInfo { peer_certificate })
+        Some(crate::tls::TlsInfo {
+            peer_certificate,
+            keying_material: native_tls_keying_material(specs),
+        })
     }
 }
 
 #[cfg(feature = "__native-tls")]
 impl TlsInfoFactory for hyper_tls::MaybeHttpsStream<TokioIo<tokio::net::TcpStream>> {
-    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+    fn tls_info(
+        &self,
+        specs: &[crate::tls_keying_material::KeyingMaterialSpec],
+    ) -> Option<crate::tls::TlsInfo> {
         match self {
-            hyper_tls::MaybeHttpsStream::Https(tls) => tls.tls_info(),
+            hyper_tls::MaybeHttpsStream::Https(tls) => tls.tls_info(specs),
             hyper_tls::MaybeHttpsStream::Http(_) => None,
         }
     }
@@ -1017,14 +1130,20 @@ impl TlsInfoFactory for hyper_tls::MaybeHttpsStream<TokioIo<tokio::net::TcpStrea
 
 #[cfg(feature = "__rustls")]
 impl TlsInfoFactory for tokio_rustls::client::TlsStream<TokioIo<TokioIo<tokio::net::TcpStream>>> {
-    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
-        let peer_certificate = self
-            .get_ref()
-            .1
+    fn tls_info(
+        &self,
+        specs: &[crate::tls_keying_material::KeyingMaterialSpec],
+    ) -> Option<crate::tls::TlsInfo> {
+        let (_, conn) = self.get_ref();
+        let peer_certificate = conn
             .peer_certificates()
             .and_then(|certs| certs.first())
             .map(|c| c.to_vec());
-        Some(crate::tls::TlsInfo { peer_certificate })
+        let keying_material = rustls_export_keying_material(conn, specs);
+        Some(crate::tls::TlsInfo {
+            peer_certificate,
+            keying_material,
+        })
     }
 }
 
@@ -1034,22 +1153,31 @@ impl TlsInfoFactory
         TokioIo<hyper_rustls::MaybeHttpsStream<TokioIo<tokio::net::TcpStream>>>,
     >
 {
-    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
-        let peer_certificate = self
-            .get_ref()
-            .1
+    fn tls_info(
+        &self,
+        specs: &[crate::tls_keying_material::KeyingMaterialSpec],
+    ) -> Option<crate::tls::TlsInfo> {
+        let (_, conn) = self.get_ref();
+        let peer_certificate = conn
             .peer_certificates()
             .and_then(|certs| certs.first())
             .map(|c| c.to_vec());
-        Some(crate::tls::TlsInfo { peer_certificate })
+        let keying_material = rustls_export_keying_material(conn, specs);
+        Some(crate::tls::TlsInfo {
+            peer_certificate,
+            keying_material,
+        })
     }
 }
 
 #[cfg(feature = "__rustls")]
 impl TlsInfoFactory for hyper_rustls::MaybeHttpsStream<TokioIo<tokio::net::TcpStream>> {
-    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+    fn tls_info(
+        &self,
+        specs: &[crate::tls_keying_material::KeyingMaterialSpec],
+    ) -> Option<crate::tls::TlsInfo> {
         match self {
-            hyper_rustls::MaybeHttpsStream::Https(tls) => tls.tls_info(),
+            hyper_rustls::MaybeHttpsStream::Https(tls) => tls.tls_info(specs),
             hyper_rustls::MaybeHttpsStream::Http(_) => None,
         }
     }
@@ -1060,7 +1188,10 @@ impl TlsInfoFactory for hyper_rustls::MaybeHttpsStream<TokioIo<tokio::net::TcpSt
 #[cfg(feature = "__tls")]
 #[cfg(unix)]
 impl TlsInfoFactory for tokio::net::UnixStream {
-    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+    fn tls_info(
+        &self,
+        _specs: &[crate::tls_keying_material::KeyingMaterialSpec],
+    ) -> Option<crate::tls::TlsInfo> {
         None
     }
 }
@@ -1068,14 +1199,20 @@ impl TlsInfoFactory for tokio::net::UnixStream {
 #[cfg(feature = "__native-tls")]
 #[cfg(unix)]
 impl TlsInfoFactory for tokio_native_tls::TlsStream<TokioIo<TokioIo<tokio::net::UnixStream>>> {
-    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+    fn tls_info(
+        &self,
+        specs: &[crate::tls_keying_material::KeyingMaterialSpec],
+    ) -> Option<crate::tls::TlsInfo> {
         let peer_certificate = self
             .get_ref()
             .peer_certificate()
             .ok()
             .flatten()
             .and_then(|c| c.to_der().ok());
-        Some(crate::tls::TlsInfo { peer_certificate })
+        Some(crate::tls::TlsInfo {
+            peer_certificate,
+            keying_material: native_tls_keying_material(specs),
+        })
     }
 }
 
@@ -1086,23 +1223,32 @@ impl TlsInfoFactory
         TokioIo<hyper_tls::MaybeHttpsStream<TokioIo<tokio::net::UnixStream>>>,
     >
 {
-    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+    fn tls_info(
+        &self,
+        specs: &[crate::tls_keying_material::KeyingMaterialSpec],
+    ) -> Option<crate::tls::TlsInfo> {
         let peer_certificate = self
             .get_ref()
             .peer_certificate()
             .ok()
             .flatten()
             .and_then(|c| c.to_der().ok());
-        Some(crate::tls::TlsInfo { peer_certificate })
+        Some(crate::tls::TlsInfo {
+            peer_certificate,
+            keying_material: native_tls_keying_material(specs),
+        })
     }
 }
 
 #[cfg(feature = "__native-tls")]
 #[cfg(unix)]
 impl TlsInfoFactory for hyper_tls::MaybeHttpsStream<TokioIo<tokio::net::UnixStream>> {
-    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+    fn tls_info(
+        &self,
+        specs: &[crate::tls_keying_material::KeyingMaterialSpec],
+    ) -> Option<crate::tls::TlsInfo> {
         match self {
-            hyper_tls::MaybeHttpsStream::Https(tls) => tls.tls_info(),
+            hyper_tls::MaybeHttpsStream::Https(tls) => tls.tls_info(specs),
             hyper_tls::MaybeHttpsStream::Http(_) => None,
         }
     }
@@ -1111,14 +1257,20 @@ impl TlsInfoFactory for hyper_tls::MaybeHttpsStream<TokioIo<tokio::net::UnixStre
 #[cfg(feature = "__rustls")]
 #[cfg(unix)]
 impl TlsInfoFactory for tokio_rustls::client::TlsStream<TokioIo<TokioIo<tokio::net::UnixStream>>> {
-    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
-        let peer_certificate = self
-            .get_ref()
-            .1
+    fn tls_info(
+        &self,
+        specs: &[crate::tls_keying_material::KeyingMaterialSpec],
+    ) -> Option<crate::tls::TlsInfo> {
+        let (_, conn) = self.get_ref();
+        let peer_certificate = conn
             .peer_certificates()
             .and_then(|certs| certs.first())
             .map(|c| c.to_vec());
-        Some(crate::tls::TlsInfo { peer_certificate })
+        let keying_material = rustls_export_keying_material(conn, specs);
+        Some(crate::tls::TlsInfo {
+            peer_certificate,
+            keying_material,
+        })
     }
 }
 
@@ -1129,23 +1281,32 @@ impl TlsInfoFactory
         TokioIo<hyper_rustls::MaybeHttpsStream<TokioIo<tokio::net::UnixStream>>>,
     >
 {
-    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
-        let peer_certificate = self
-            .get_ref()
-            .1
+    fn tls_info(
+        &self,
+        specs: &[crate::tls_keying_material::KeyingMaterialSpec],
+    ) -> Option<crate::tls::TlsInfo> {
+        let (_, conn) = self.get_ref();
+        let peer_certificate = conn
             .peer_certificates()
             .and_then(|certs| certs.first())
             .map(|c| c.to_vec());
-        Some(crate::tls::TlsInfo { peer_certificate })
+        let keying_material = rustls_export_keying_material(conn, specs);
+        Some(crate::tls::TlsInfo {
+            peer_certificate,
+            keying_material,
+        })
     }
 }
 
 #[cfg(feature = "__rustls")]
 #[cfg(unix)]
 impl TlsInfoFactory for hyper_rustls::MaybeHttpsStream<TokioIo<tokio::net::UnixStream>> {
-    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+    fn tls_info(
+        &self,
+        specs: &[crate::tls_keying_material::KeyingMaterialSpec],
+    ) -> Option<crate::tls::TlsInfo> {
         match self {
-            hyper_rustls::MaybeHttpsStream::Https(tls) => tls.tls_info(),
+            hyper_rustls::MaybeHttpsStream::Https(tls) => tls.tls_info(specs),
             hyper_rustls::MaybeHttpsStream::Http(_) => None,
         }
     }
@@ -1156,7 +1317,10 @@ impl TlsInfoFactory for hyper_rustls::MaybeHttpsStream<TokioIo<tokio::net::UnixS
 #[cfg(feature = "__tls")]
 #[cfg(target_os = "windows")]
 impl TlsInfoFactory for tokio::net::windows::named_pipe::NamedPipeClient {
-    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+    fn tls_info(
+        &self,
+        _specs: &[crate::tls_keying_material::KeyingMaterialSpec],
+    ) -> Option<crate::tls::TlsInfo> {
         None
     }
 }
@@ -1168,14 +1332,20 @@ impl TlsInfoFactory
         TokioIo<TokioIo<tokio::net::windows::named_pipe::NamedPipeClient>>,
     >
 {
-    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+    fn tls_info(
+        &self,
+        specs: &[crate::tls_keying_material::KeyingMaterialSpec],
+    ) -> Option<crate::tls::TlsInfo> {
         let peer_certificate = self
             .get_ref()
             .peer_certificate()
             .ok()
             .flatten()
             .and_then(|c| c.to_der().ok());
-        Some(crate::tls::TlsInfo { peer_certificate })
+        Some(crate::tls::TlsInfo {
+            peer_certificate,
+            keying_material: native_tls_keying_material(specs),
+        })
     }
 }
 
@@ -1188,14 +1358,20 @@ impl TlsInfoFactory
         >,
     >
 {
-    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+    fn tls_info(
+        &self,
+        specs: &[crate::tls_keying_material::KeyingMaterialSpec],
+    ) -> Option<crate::tls::TlsInfo> {
         let peer_certificate = self
             .get_ref()
             .peer_certificate()
             .ok()
             .flatten()
             .and_then(|c| c.to_der().ok());
-        Some(crate::tls::TlsInfo { peer_certificate })
+        Some(crate::tls::TlsInfo {
+            peer_certificate,
+            keying_material: native_tls_keying_material(specs),
+        })
     }
 }
 
@@ -1204,9 +1380,12 @@ impl TlsInfoFactory
 impl TlsInfoFactory
     for hyper_tls::MaybeHttpsStream<TokioIo<tokio::net::windows::named_pipe::NamedPipeClient>>
 {
-    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+    fn tls_info(
+        &self,
+        specs: &[crate::tls_keying_material::KeyingMaterialSpec],
+    ) -> Option<crate::tls::TlsInfo> {
         match self {
-            hyper_tls::MaybeHttpsStream::Https(tls) => tls.tls_info(),
+            hyper_tls::MaybeHttpsStream::Https(tls) => tls.tls_info(specs),
             hyper_tls::MaybeHttpsStream::Http(_) => None,
         }
     }
@@ -1219,14 +1398,20 @@ impl TlsInfoFactory
         TokioIo<TokioIo<tokio::net::windows::named_pipe::NamedPipeClient>>,
     >
 {
-    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
-        let peer_certificate = self
-            .get_ref()
-            .1
+    fn tls_info(
+        &self,
+        specs: &[crate::tls_keying_material::KeyingMaterialSpec],
+    ) -> Option<crate::tls::TlsInfo> {
+        let (_, conn) = self.get_ref();
+        let peer_certificate = conn
             .peer_certificates()
             .and_then(|certs| certs.first())
             .map(|c| c.to_vec());
-        Some(crate::tls::TlsInfo { peer_certificate })
+        let keying_material = rustls_export_keying_material(conn, specs);
+        Some(crate::tls::TlsInfo {
+            peer_certificate,
+            keying_material,
+        })
     }
 }
 
@@ -1241,14 +1426,20 @@ impl TlsInfoFactory
         >,
     >
 {
-    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
-        let peer_certificate = self
-            .get_ref()
-            .1
+    fn tls_info(
+        &self,
+        specs: &[crate::tls_keying_material::KeyingMaterialSpec],
+    ) -> Option<crate::tls::TlsInfo> {
+        let (_, conn) = self.get_ref();
+        let peer_certificate = conn
             .peer_certificates()
             .and_then(|certs| certs.first())
             .map(|c| c.to_vec());
-        Some(crate::tls::TlsInfo { peer_certificate })
+        let keying_material = rustls_export_keying_material(conn, specs);
+        Some(crate::tls::TlsInfo {
+            peer_certificate,
+            keying_material,
+        })
     }
 }
 
@@ -1257,12 +1448,69 @@ impl TlsInfoFactory
 impl TlsInfoFactory
     for hyper_rustls::MaybeHttpsStream<TokioIo<tokio::net::windows::named_pipe::NamedPipeClient>>
 {
-    fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
+    fn tls_info(
+        &self,
+        specs: &[crate::tls_keying_material::KeyingMaterialSpec],
+    ) -> Option<crate::tls::TlsInfo> {
         match self {
-            hyper_rustls::MaybeHttpsStream::Https(tls) => tls.tls_info(),
+            hyper_rustls::MaybeHttpsStream::Https(tls) => tls.tls_info(specs),
             hyper_rustls::MaybeHttpsStream::Http(_) => None,
         }
     }
+}
+
+/// native-tls cannot export RFC 5705 / RFC 8446 keying material today.
+/// Always returns an empty `Vec`; emits a single `debug`-level log per
+/// process the first time a non-empty spec slice is observed so that callers
+/// see why their lookups return `None`.
+#[cfg(feature = "__native-tls")]
+fn native_tls_keying_material(
+    specs: &[crate::tls_keying_material::KeyingMaterialSpec],
+) -> Vec<crate::tls_keying_material::KeyingMaterialEntry> {
+    if !specs.is_empty() {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            log::debug!(
+                "TLS exporter (RFC 5705 / RFC 8446) is not supported with the \
+                 native-tls backend; registered keying material specs will be ignored. \
+                 Use the rustls backend if you need this."
+            );
+        });
+    }
+    Vec::new()
+}
+
+/// Derive one [`crate::tls_keying_material::KeyingMaterialEntry`] per spec from a freshly
+/// completed rustls handshake. Failures (e.g. requested length larger than
+/// rustls allows) are logged at `debug` level and the entry is silently
+/// dropped; the connection is **not** failed because of an exporter mishap.
+#[cfg(feature = "__rustls")]
+fn rustls_export_keying_material(
+    conn: &rustls::ClientConnection,
+    specs: &[crate::tls_keying_material::KeyingMaterialSpec],
+) -> Vec<crate::tls_keying_material::KeyingMaterialEntry> {
+    let mut out = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let buf = vec![0u8; spec.length];
+        match conn.export_keying_material(buf, &spec.label, spec.context.as_deref()) {
+            Ok(material) => out.push(crate::tls_keying_material::KeyingMaterialEntry {
+                label: spec.label.clone(),
+                context: spec.context.clone(),
+                material,
+            }),
+            Err(e) => {
+                // SECURITY: do not log spec.label/context values verbatim — they
+                // are caller-supplied but logging length + error is sufficient.
+                log::debug!(
+                    "rustls export_keying_material failed (label_len={}, ctx={}, out_len={}): {e}",
+                    spec.label.len(),
+                    spec.context.as_ref().map_or("none", |_| "set"),
+                    spec.length,
+                );
+            }
+        }
+    }
+    out
 }
 
 pub(crate) trait AsyncConn:
@@ -1301,6 +1549,8 @@ pub(crate) mod sealed {
             pub(super) is_proxy: bool,
             // Only needed for __tls, but #[cfg()] on fields breaks pin_project!
             pub(super) tls_info: bool,
+            // Only needed for __tls, but #[cfg()] on fields breaks pin_project!
+            pub(super) keying_material_specs: std::sync::Arc<[crate::tls_keying_material::KeyingMaterialSpec]>,
         }
     }
 
@@ -1309,7 +1559,7 @@ pub(crate) mod sealed {
             let connected = self.inner.connected().proxy(self.is_proxy);
             #[cfg(feature = "__tls")]
             if self.tls_info {
-                if let Some(tls_info) = self.inner.tls_info() {
+                if let Some(tls_info) = self.inner.tls_info(&self.keying_material_specs) {
                     connected.extra(tls_info)
                 } else {
                     connected
@@ -1632,8 +1882,11 @@ mod native_tls_conn {
     where
         TokioIo<TlsStream<T>>: TlsInfoFactory,
     {
-        fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
-            self.inner.tls_info()
+        fn tls_info(
+            &self,
+            specs: &[crate::tls_keying_material::KeyingMaterialSpec],
+        ) -> Option<crate::tls::TlsInfo> {
+            self.inner.tls_info(specs)
         }
     }
 }
@@ -1820,8 +2073,11 @@ mod rustls_tls_conn {
     where
         TokioIo<TlsStream<T>>: TlsInfoFactory,
     {
-        fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
-            self.inner.tls_info()
+        fn tls_info(
+            &self,
+            specs: &[crate::tls_keying_material::KeyingMaterialSpec],
+        ) -> Option<crate::tls::TlsInfo> {
+            self.inner.tls_info(specs)
         }
     }
 }
@@ -2064,8 +2320,11 @@ mod verbose {
 
     #[cfg(feature = "__tls")]
     impl<T: super::TlsInfoFactory> super::TlsInfoFactory for Verbose<T> {
-        fn tls_info(&self) -> Option<crate::tls::TlsInfo> {
-            self.inner.tls_info()
+        fn tls_info(
+            &self,
+            specs: &[crate::tls_keying_material::KeyingMaterialSpec],
+        ) -> Option<crate::tls::TlsInfo> {
+            self.inner.tls_info(specs)
         }
     }
 

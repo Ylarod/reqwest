@@ -381,6 +381,11 @@ if_hyper! {
     pub mod retry;
     #[cfg(feature = "__tls")]
     pub mod tls;
+    // Always-on home for the EKM (TLS exporter) types. They live outside
+    // `tls` because `pin_project_lite` cannot cfg-gate individual struct
+    // fields, so the field type must be available in builds without any TLS
+    // backend feature enabled too.
+    mod tls_keying_material;
     mod util;
 
     #[cfg(docsrs)]

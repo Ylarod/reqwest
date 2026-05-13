@@ -1,3 +1,10 @@
+## Unreleased
+
+- Add `ClientBuilder::tls_export_keying_material` and `TlsInfo::keying_material`
+  for accessing RFC 5705 / RFC 8446 exported keying material. Supported
+  with the `rustls` backend; the `native-tls` backend accepts the spec but
+  produces no entries (logged once at `debug` level).
+
 ## v0.13.3
 
 - Fix CertificateRevocationList parsing of PEM values.

@@ -200,6 +200,8 @@ struct Config {
     #[cfg(feature = "__tls")]
     tls_info: bool,
     #[cfg(feature = "__tls")]
+    tls_keying_material_exports: Vec<crate::tls_keying_material::KeyingMaterialSpec>,
+    #[cfg(feature = "__tls")]
     tls: TlsBackend,
     connector_layers: Vec<BoxedConnectorLayer>,
     http_version_pref: HttpVersionPref,
@@ -327,6 +329,8 @@ impl ClientBuilder {
                 #[cfg(feature = "__tls")]
                 tls_info: false,
                 #[cfg(feature = "__tls")]
+                tls_keying_material_exports: Vec::new(),
+                #[cfg(feature = "__tls")]
                 tls: TlsBackend::default(),
                 connector_layers: Vec::new(),
                 http_version_pref: HttpVersionPref::All,
@@ -440,6 +444,14 @@ impl ClientBuilder {
             }
             DynResolver::new(resolver)
         };
+
+        // Materialize the EKM (TLS exporter, RFC 5705 / RFC 8446) spec
+        // list into a single `Arc<[…]>` so it can be cheaply propagated into
+        // every `ConnectorBuilder::*` constructor below and shared across
+        // all connections produced by this client.
+        #[cfg(feature = "__tls")]
+        let keying_material_specs: Arc<[crate::tls_keying_material::KeyingMaterialSpec]> =
+            Arc::from(config.tls_keying_material_exports.clone());
 
         let mut connector_builder = {
             #[cfg(feature = "__tls")]
@@ -612,6 +624,7 @@ impl ClientBuilder {
                         config.interface.as_deref(),
                         config.nodelay,
                         config.tls_info,
+                        keying_material_specs.clone(),
                     )?
                 }
                 #[cfg(feature = "__native-tls")]
@@ -636,6 +649,7 @@ impl ClientBuilder {
                     config.interface.as_deref(),
                     config.nodelay,
                     config.tls_info,
+                    keying_material_specs.clone(),
                 ),
                 #[cfg(feature = "__rustls")]
                 TlsBackend::BuiltRustls(conn) => {
@@ -680,6 +694,7 @@ impl ClientBuilder {
                         config.interface.as_deref(),
                         config.nodelay,
                         config.tls_info,
+                        keying_material_specs.clone(),
                     )
                 }
                 #[cfg(feature = "__rustls")]
@@ -884,6 +899,7 @@ impl ClientBuilder {
                         config.interface.as_deref(),
                         config.nodelay,
                         config.tls_info,
+                        keying_material_specs.clone(),
                     )
                 }
                 #[cfg(any(feature = "__native-tls", feature = "__rustls",))]
@@ -2242,6 +2258,106 @@ impl ClientBuilder {
         self
     }
 
+    /// Register a TLS keying material export (RFC 5705 / RFC 8446).
+    ///
+    /// Each call adds one `(label, context, length)` spec. After every
+    /// successful TLS handshake on a connection produced by this client, the
+    /// derived bytes are stored on the [`TlsInfo`][crate::tls::TlsInfo]
+    /// extension attached to responses (this also requires
+    /// [`tls_info(true)`][Self::tls_info]). Lookup is via
+    /// [`TlsInfo::keying_material`][crate::tls::TlsInfo::keying_material].
+    ///
+    /// Only the `rustls` backend supports the exporter today. With
+    /// `native-tls` the spec is accepted but no material is produced;
+    /// a single `debug`-level log is emitted per process to warn callers.
+    ///
+    /// The exporter primitive is the same in RFC 5705 (TLS 1.0–1.2) and RFC
+    /// 8446 (TLS 1.3); higher-level applications like RFC 9266 channel
+    /// binding just pass the appropriate `label` / `context` / `length`.
+    ///
+    /// # Optional
+    ///
+    /// This requires the optional `default-tls`, `native-tls`, or
+    /// `rustls(-...)` feature to be enabled.
+    ///
+    /// # Behavior
+    ///
+    /// - `length` must be greater than zero. Calling this method with
+    ///   `length == 0` records a build error; the subsequent
+    ///   [`ClientBuilder::build`] call will fail.
+    /// - If this method is called more than once with the same
+    ///   `(label, context)` pair, the most recent call wins: the earlier
+    ///   spec (including its `length`) is replaced. Lookup via
+    ///   [`crate::tls::TlsInfo::keying_material`] returns the bytes
+    ///   derived from the last registration.
+    ///
+    /// # Example: RFC 9266 channel binding token
+    ///
+    /// ```no_run
+    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// let client = reqwest::Client::builder()
+    ///     .tls_info(true)
+    ///     .min_tls_version(reqwest::tls::Version::TLS_1_3)
+    ///     .tls_export_keying_material(b"EXPORTER-Channel-Binding".to_vec(), None, 32)
+    ///     .build()?;
+    ///
+    /// let resp = client.get("https://example.com").send().await?;
+    /// if let Some(info) = resp.extensions().get::<reqwest::tls::TlsInfo>() {
+    ///     if let Some(cbt) = info.keying_material(b"EXPORTER-Channel-Binding", None) {
+    ///         assert_eq!(cbt.len(), 32);
+    ///     }
+    /// }
+    /// # Ok(()) }
+    /// ```
+    #[cfg(feature = "__tls")]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(any(feature = "default-tls", feature = "native-tls", feature = "rustls")))
+    )]
+    pub fn tls_export_keying_material(
+        mut self,
+        label: impl Into<Vec<u8>>,
+        context: Option<Vec<u8>>,
+        length: usize,
+    ) -> ClientBuilder {
+        if length == 0 {
+            self.config.error = Some(crate::error::builder(
+                "tls_export_keying_material: length must be greater than zero",
+            ));
+            return self;
+        }
+        let label = label.into();
+        let spec = crate::tls_keying_material::KeyingMaterialSpec {
+            label,
+            context,
+            length,
+        };
+        // Last-write-wins: replace any prior registration with the same
+        // (label, context) pair so that duplicate specs are not silently
+        // de-prioritized by the `Vec::iter().find(...)` lookup in
+        // `TlsInfo::keying_material`.
+        if let Some(existing) = self
+            .config
+            .tls_keying_material_exports
+            .iter_mut()
+            .find(|s| s.label == spec.label && s.context == spec.context)
+        {
+            *existing = spec;
+        } else {
+            self.config.tls_keying_material_exports.push(spec);
+        }
+        self
+    }
+
+    /// Test-only accessor used by unit tests to inspect the registered EKM
+    /// specs without exposing the field publicly.
+    #[cfg(all(test, feature = "__tls"))]
+    pub(crate) fn peek_tls_keying_material_specs_for_test(
+        &self,
+    ) -> &[crate::tls_keying_material::KeyingMaterialSpec] {
+        &self.config.tls_keying_material_exports
+    }
+
     /// Restrict the Client to be used with HTTPS only requests.
     ///
     /// Defaults to false.
@@ -2880,6 +2996,15 @@ impl Config {
             f.field("tls_sni", &self.tls_sni);
 
             f.field("tls_info", &self.tls_info);
+
+            // SECURITY: only print the count of registered EKM specs, never
+            // the labels/contexts/lengths themselves (labels are typically
+            // public, but logging counts keeps Debug output tight and avoids
+            // any chance of leaking caller-supplied data).
+            f.field(
+                "tls_keying_material_exports",
+                &self.tls_keying_material_exports.len(),
+            );
         }
 
         #[cfg(feature = "__rustls")]
@@ -3172,5 +3297,54 @@ mod tests {
     fn test_future_size() {
         let s = std::mem::size_of::<super::Pending>();
         assert!(s < 128, "size_of::<Pending>() == {s}, too big");
+    }
+
+    /// FINDING 1: A zero-length keying-material spec must be rejected at
+    /// builder time. We do not silently hand back an empty `Some(&[])`.
+    #[cfg(feature = "__tls")]
+    #[test]
+    fn tls_export_keying_material_zero_length_fails_build() {
+        use std::error::Error as _;
+
+        let result = crate::ClientBuilder::new()
+            .tls_export_keying_material(b"EXPORTER-Test".to_vec(), None, 0)
+            .build();
+        let err = result.expect_err("build must fail when length == 0");
+        assert!(err.is_builder(), "error must be a builder error: {err:?}");
+        // The user-visible Display impl is "builder error"; the real reason
+        // is wrapped as the source. Walk the chain so this test stays robust
+        // if the wrapper Display format changes.
+        let mut cause: Option<&dyn std::error::Error> = err.source();
+        let mut found = false;
+        while let Some(src) = cause {
+            if format!("{src}").contains("length must be greater than zero") {
+                found = true;
+                break;
+            }
+            cause = src.source();
+        }
+        assert!(
+            found,
+            "error chain must explain the constraint; chain: {err:?}",
+        );
+    }
+
+    /// FINDING 2: Registering the same `(label, context)` twice replaces the
+    /// earlier spec (last-write-wins). After registering `(b"X", None, 16)`
+    /// followed by `(b"X", None, 32)`, only the 32-byte spec should remain.
+    #[cfg(feature = "__tls")]
+    #[test]
+    fn tls_export_keying_material_duplicate_replaces() {
+        let builder = crate::ClientBuilder::new()
+            .tls_export_keying_material(b"X".to_vec(), None, 16)
+            .tls_export_keying_material(b"X".to_vec(), None, 32);
+        // Peek inside the builder via a debug-formatted view; we don't expose
+        // the spec list publicly, so the assertion goes through the config
+        // field on the unbuilt builder. Use a helper accessor.
+        let specs = builder.peek_tls_keying_material_specs_for_test();
+        assert_eq!(specs.len(), 1, "duplicate (label, context) must dedupe");
+        assert_eq!(specs[0].label.as_slice(), b"X");
+        assert_eq!(specs[0].context, None);
+        assert_eq!(specs[0].length, 32, "last write wins on length");
     }
 }
