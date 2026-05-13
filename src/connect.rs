@@ -1087,7 +1087,7 @@ impl TlsInfoFactory for tokio_native_tls::TlsStream<TokioIo<TokioIo<tokio::net::
             .and_then(|c| c.to_der().ok());
         Some(crate::tls::TlsInfo {
             peer_certificate,
-            keying_material: native_tls_keying_material(specs),
+            keying_material: native_tls_keying_material(self.get_ref(), specs),
         })
     }
 }
@@ -1110,7 +1110,7 @@ impl TlsInfoFactory
             .and_then(|c| c.to_der().ok());
         Some(crate::tls::TlsInfo {
             peer_certificate,
-            keying_material: native_tls_keying_material(specs),
+            keying_material: native_tls_keying_material(self.get_ref(), specs),
         })
     }
 }
@@ -1211,7 +1211,7 @@ impl TlsInfoFactory for tokio_native_tls::TlsStream<TokioIo<TokioIo<tokio::net::
             .and_then(|c| c.to_der().ok());
         Some(crate::tls::TlsInfo {
             peer_certificate,
-            keying_material: native_tls_keying_material(specs),
+            keying_material: native_tls_keying_material(self.get_ref(), specs),
         })
     }
 }
@@ -1235,7 +1235,7 @@ impl TlsInfoFactory
             .and_then(|c| c.to_der().ok());
         Some(crate::tls::TlsInfo {
             peer_certificate,
-            keying_material: native_tls_keying_material(specs),
+            keying_material: native_tls_keying_material(self.get_ref(), specs),
         })
     }
 }
@@ -1344,7 +1344,7 @@ impl TlsInfoFactory
             .and_then(|c| c.to_der().ok());
         Some(crate::tls::TlsInfo {
             peer_certificate,
-            keying_material: native_tls_keying_material(specs),
+            keying_material: native_tls_keying_material(self.get_ref(), specs),
         })
     }
 }
@@ -1370,7 +1370,7 @@ impl TlsInfoFactory
             .and_then(|c| c.to_der().ok());
         Some(crate::tls::TlsInfo {
             peer_certificate,
-            keying_material: native_tls_keying_material(specs),
+            keying_material: native_tls_keying_material(self.get_ref(), specs),
         })
     }
 }
@@ -1459,25 +1459,48 @@ impl TlsInfoFactory
     }
 }
 
-/// native-tls cannot export RFC 5705 / RFC 8446 keying material today.
-/// Always returns an empty `Vec`; emits a single `debug`-level log per
-/// process the first time a non-empty spec slice is observed so that callers
-/// see why their lookups return `None`.
+/// Derive one [`crate::tls_keying_material::KeyingMaterialEntry`] per spec
+/// from a freshly completed native-tls handshake.
+///
+/// EKM is only implemented by native-tls' OpenSSL backend (Linux, Android,
+/// non-Apple Unixes, and vendored). On the Apple Secure Transport and
+/// Windows SChannel backends `export_keying_material` returns an error; we
+/// treat that the same as any other per-spec failure: skip the entry,
+/// emit a `debug`-level log, do **not** fail the connection.
+///
+/// Failures (unsupported backend, bad length, invalid UTF-8 label on the
+/// OpenSSL backend, etc.) are also logged at `debug` and the spec is
+/// silently dropped from the resulting `Vec`.
 #[cfg(feature = "__native-tls")]
-fn native_tls_keying_material(
+fn native_tls_keying_material<S>(
+    stream: &native_tls_crate::TlsStream<S>,
     specs: &[crate::tls_keying_material::KeyingMaterialSpec],
-) -> Vec<crate::tls_keying_material::KeyingMaterialEntry> {
-    if !specs.is_empty() {
-        static WARNED: std::sync::Once = std::sync::Once::new();
-        WARNED.call_once(|| {
-            log::debug!(
-                "TLS exporter (RFC 5705 / RFC 8446) is not supported with the \
-                 native-tls backend; registered keying material specs will be ignored. \
-                 Use the rustls backend if you need this."
-            );
-        });
+) -> Vec<crate::tls_keying_material::KeyingMaterialEntry>
+where
+    S: std::io::Read + std::io::Write,
+{
+    let mut out = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let mut buf = vec![0u8; spec.length];
+        match stream.export_keying_material(&mut buf, &spec.label, spec.context.as_deref()) {
+            Ok(()) => out.push(crate::tls_keying_material::KeyingMaterialEntry {
+                label: spec.label.clone(),
+                context: spec.context.clone(),
+                material: buf,
+            }),
+            Err(e) => {
+                // SECURITY: never log raw label or context contents.
+                log::debug!(
+                    "native-tls export_keying_material failed \
+                     (label_len={}, context={}, length={}): {e}",
+                    spec.label.len(),
+                    if spec.context.is_some() { "set" } else { "none" },
+                    spec.length,
+                );
+            }
+        }
     }
-    Vec::new()
+    out
 }
 
 /// Derive one [`crate::tls_keying_material::KeyingMaterialEntry`] per spec from a freshly

@@ -2267,9 +2267,12 @@ impl ClientBuilder {
     /// [`tls_info(true)`][Self::tls_info]). Lookup is via
     /// [`TlsInfo::keying_material`][crate::tls::TlsInfo::keying_material].
     ///
-    /// Only the `rustls` backend supports the exporter today. With
-    /// `native-tls` the spec is accepted but no material is produced;
-    /// a single `debug`-level log is emitted per process to warn callers.
+    /// Backend support: `rustls` (always), and `native-tls` only when
+    /// backed by OpenSSL (Linux, Android, non-Apple Unixes, vendored).
+    /// On native-tls with Secure Transport (Apple) or SChannel (Windows)
+    /// per-spec derivation returns an error and the spec is silently
+    /// skipped (debug-logged); [`TlsInfo::keying_material`] then yields
+    /// `None` for that spec.
     ///
     /// The exporter primitive is the same in RFC 5705 (TLS 1.0–1.2) and RFC
     /// 8446 (TLS 1.3); higher-level applications like RFC 9266 channel

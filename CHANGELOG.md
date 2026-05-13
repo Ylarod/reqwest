@@ -1,9 +1,12 @@
 ## Unreleased
 
 - Add `ClientBuilder::tls_export_keying_material` and `TlsInfo::keying_material`
-  for accessing RFC 5705 / RFC 8446 exported keying material. Supported
-  with the `rustls` backend; the `native-tls` backend accepts the spec but
-  produces no entries (logged once at `debug` level).
+  for accessing RFC 5705 / RFC 8446 exported keying material. Supported on
+  `rustls` (always) and on `native-tls` when backed by OpenSSL (Linux,
+  Android, non-Apple Unixes, vendored builds). On native-tls with Secure
+  Transport (Apple) or SChannel (Windows) the spec is accepted but no
+  bytes are produced — per-spec failures are silently dropped with a
+  `debug`-level log.
 
 ## v0.13.3
 

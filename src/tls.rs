@@ -77,9 +77,18 @@
 //! derived bytes are stored in the [`TlsInfo`] extension on the response and
 //! can be retrieved with [`TlsInfo::keying_material`].
 //!
-//! Only the `rustls` backend currently produces material; with `native-tls`
-//! the spec is accepted but no material is exposed (a `debug`-level log is
-//! emitted once per process).
+//! ## Backend support
+//!
+//! - `rustls` / `rustls-no-provider`: fully supported on both TLS 1.2 and
+//!   TLS 1.3.
+//! - `native-tls`: supported **only on the OpenSSL backend** (Linux,
+//!   Android, FreeBSD/NetBSD/OpenBSD, and vendored builds). On macOS/iOS
+//!   (Secure Transport) and Windows (SChannel) the underlying TLS library
+//!   does not expose the exporter primitive, so per-spec derivation
+//!   returns an error and the entry is silently skipped (with a
+//!   `debug`-level log line). Callers should treat
+//!   [`TlsInfo::keying_material`] returning `None` as "EKM unavailable on
+//!   this platform/backend".
 //!
 //! [RFC 5705]: https://datatracker.ietf.org/doc/html/rfc5705
 //! [RFC 8446]: https://datatracker.ietf.org/doc/html/rfc8446#section-7.5
