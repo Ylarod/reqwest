@@ -286,11 +286,11 @@ name = "multipart"
 path = "tests/multipart.rs"
 required-features = ["multipart"]
 
-# Use a local fork of native-tls until the upstream EKM PR is merged and
-# released. The fork at ../rust-native-tls exposes
+# Use a fork of native-tls until the upstream EKM PR is merged and released.
+# The fork at https://github.com/Ylarod/rust-native-tls exposes
 # `TlsStream::export_keying_material` (RFC 5705 / RFC 8446) on the OpenSSL
 # backend; Apple (Secure Transport) and Windows (SChannel) backends return
 # an error from that call, which reqwest handles by skipping the spec with
 # a debug-level log.
 [patch.crates-io]
-native-tls = { path = "../rust-native-tls" }
+native-tls = { git = "https://github.com/Ylarod/rust-native-tls", rev = "b24b2fe" }
