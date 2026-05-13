@@ -64,6 +64,28 @@
 //! [rustls CryptoProvider]: https://docs.rs/rustls/latest/rustls/crypto/struct.CryptoProvider.html
 //! [ring]: https://crates.io/crates/ring
 //! [`CryptoProvider::install_default`]: https://docs.rs/rustls/latest/rustls/crypto/struct.CryptoProvider.html#method.install_default
+//!
+//! # TLS Exporter (RFC 5705 / RFC 8446)
+//!
+//! Reqwest can expose "exported keying material" derived from a completed TLS
+//! handshake. The same primitive is defined by [RFC 5705][] for TLS 1.0–1.2
+//! and by [RFC 8446][] for TLS 1.3, and is used by higher-level
+//! constructs such as [RFC 9266][] channel binding.
+//!
+//! Specs are registered on the [`ClientBuilder`] via
+//! [`tls_export_keying_material`][]. After every successful TLS handshake the
+//! derived bytes are stored in the [`TlsInfo`] extension on the response and
+//! can be retrieved with [`TlsInfo::keying_material`].
+//!
+//! Only the `rustls` backend currently produces material; with `native-tls`
+//! the spec is accepted but no material is exposed (a `debug`-level log is
+//! emitted once per process).
+//!
+//! [RFC 5705]: https://datatracker.ietf.org/doc/html/rfc5705
+//! [RFC 8446]: https://datatracker.ietf.org/doc/html/rfc8446#section-7.5
+//! [RFC 9266]: https://datatracker.ietf.org/doc/html/rfc9266
+//! [`ClientBuilder`]: crate::ClientBuilder
+//! [`tls_export_keying_material`]: crate::ClientBuilder::tls_export_keying_material
 
 #[cfg(feature = "__rustls")]
 use rustls::{
@@ -784,11 +806,18 @@ impl ServerCertVerifier for IgnoreHostname {
     }
 }
 
+// Re-export the always-on EKM entry type so we can keep all
+// keying-material-related items reachable through `crate::tls::…`.
+// `KeyingMaterialSpec` only needs `crate::tls_keying_material::` paths
+// (used in the connector plumbing), not a re-export here.
+pub(crate) use crate::tls_keying_material::KeyingMaterialEntry;
+
 /// Hyper extension carrying extra TLS layer information.
 /// Made available to clients on responses when `tls_info` is set.
 #[derive(Clone)]
 pub struct TlsInfo {
     pub(crate) peer_certificate: Option<Vec<u8>>,
+    pub(crate) keying_material: Vec<KeyingMaterialEntry>,
 }
 
 impl TlsInfo {
@@ -796,10 +825,32 @@ impl TlsInfo {
     pub fn peer_certificate(&self) -> Option<&[u8]> {
         self.peer_certificate.as_ref().map(|der| &der[..])
     }
+
+    /// Look up [RFC 5705] / [RFC 8446] exported keying material that was
+    /// registered via [`ClientBuilder::tls_export_keying_material`].
+    ///
+    /// The lookup matches on both `label` and `context`; the `length` of the
+    /// returned slice equals what was requested when the spec was registered.
+    ///
+    /// Returns `None` if no spec with the same `(label, context)` was
+    /// registered, or if the active TLS backend cannot export keying material
+    /// (currently true for `native-tls`).
+    ///
+    /// [RFC 5705]: https://datatracker.ietf.org/doc/html/rfc5705
+    /// [RFC 8446]: https://datatracker.ietf.org/doc/html/rfc8446#section-7.5
+    /// [`ClientBuilder::tls_export_keying_material`]:
+    ///     crate::ClientBuilder::tls_export_keying_material
+    pub fn keying_material(&self, label: &[u8], context: Option<&[u8]>) -> Option<&[u8]> {
+        self.keying_material
+            .iter()
+            .find(|entry| entry.label == label && entry.context.as_deref() == context)
+            .map(|entry| entry.material.as_slice())
+    }
 }
 
 impl std::fmt::Debug for TlsInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        // SECURITY: do not leak peer cert bytes or EKM material via Debug.
         f.debug_struct("TlsInfo").finish()
     }
 }
@@ -895,6 +946,69 @@ mod tests {
     #[test]
     fn invalid_crl_from_pem() {
         CertificateRevocationList::from_pem(b"Invalid").unwrap_err();
+    }
+
+    #[test]
+    fn keying_material_lookup_by_label_and_context() {
+        let info = TlsInfo {
+            peer_certificate: None,
+            keying_material: vec![
+                KeyingMaterialEntry {
+                    label: b"EXPORTER-Channel-Binding".to_vec(),
+                    context: None,
+                    material: vec![0xAAu8; 32],
+                },
+                KeyingMaterialEntry {
+                    label: b"EXPORTER-Channel-Binding".to_vec(),
+                    context: Some(b"ctx".to_vec()),
+                    material: vec![0xBBu8; 32],
+                },
+            ],
+        };
+
+        assert_eq!(
+            info.keying_material(b"EXPORTER-Channel-Binding", None),
+            Some(&[0xAAu8; 32][..])
+        );
+        assert_eq!(
+            info.keying_material(b"EXPORTER-Channel-Binding", Some(b"ctx")),
+            Some(&[0xBBu8; 32][..])
+        );
+        assert!(info
+            .keying_material(b"EXPORTER-Channel-Binding", Some(b"other"))
+            .is_none());
+        assert!(info.keying_material(b"other-label", None).is_none());
+    }
+
+    #[test]
+    fn keying_material_entry_debug_elides_material() {
+        let entry = KeyingMaterialEntry {
+            label: b"L".to_vec(),
+            context: None,
+            material: b"super-secret-bytes".to_vec(),
+        };
+        let dbg = format!("{:?}", entry);
+        assert!(
+            !dbg.contains("super-secret-bytes"),
+            "EKM bytes leaked via Debug: {dbg}"
+        );
+        // Also ensure raw byte representation is not present.
+        let bytes_repr = format!("{:?}", b"super-secret-bytes");
+        assert!(!dbg.contains(&bytes_repr), "Debug leaks raw bytes: {dbg}");
+    }
+
+    #[test]
+    fn tls_info_debug_does_not_leak_material() {
+        let info = TlsInfo {
+            peer_certificate: Some(vec![0x99u8; 4]),
+            keying_material: vec![KeyingMaterialEntry {
+                label: b"L".to_vec(),
+                context: None,
+                material: b"super-secret-bytes".to_vec(),
+            }],
+        };
+        let dbg = format!("{:?}", info);
+        assert!(!dbg.contains("super-secret-bytes"));
     }
 
     #[cfg(feature = "__rustls")]

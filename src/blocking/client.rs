@@ -1079,6 +1079,34 @@ impl ClientBuilder {
         self.with_inner(|inner| inner.tls_info(tls_info))
     }
 
+    /// Register a TLS keying material export (RFC 5705 / RFC 8446).
+    ///
+    /// See the docs on
+    /// [`async`'s `ClientBuilder::tls_export_keying_material`][async] for
+    /// semantics, backend support, and an example. Each call adds one
+    /// `(label, context, length)` spec.
+    ///
+    /// # Optional
+    ///
+    /// This requires the optional `default-tls`, `native-tls`, or
+    /// `rustls(-...)` feature to be enabled.
+    ///
+    /// [async]: crate::ClientBuilder::tls_export_keying_material
+    #[cfg(feature = "__tls")]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(any(feature = "default-tls", feature = "native-tls", feature = "rustls")))
+    )]
+    pub fn tls_export_keying_material(
+        self,
+        label: impl Into<Vec<u8>>,
+        context: Option<Vec<u8>>,
+        length: usize,
+    ) -> ClientBuilder {
+        let label = label.into();
+        self.with_inner(move |inner| inner.tls_export_keying_material(label, context, length))
+    }
+
     /// Use a preconfigured TLS backend.
     ///
     /// If the passed `Any` argument is not a TLS backend that reqwest
